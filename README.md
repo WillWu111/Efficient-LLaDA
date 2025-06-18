@@ -155,9 +155,6 @@ We provide the evaluation code in this repository, following the [lmms-eval](htt
 ## Contact
 If you have any questions, please feel free to contact us at zebin@ruc.edu.cn.
 
-## LLaDA Group Wechat QR Code
-
-![LLaDA Group Wechat QR Code](./vx.png)
 
 ## Acknowledgments
 The code is largely based on the [LLaVA-NeXT](https://github.com/LLaVA-VL/LLaVA-NeXT), [MAmmoTH-VL](https://github.com/MAmmoTH-VL/MAmmoTH-VL), [lmms-eval](https://github.com/EvolvingLMMs-Lab/lmms-eval) and [dLLM-cache](https://github.com/maomaocun/dLLM-cache/tree/main). We thank the authors for their great work.
