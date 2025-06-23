@@ -83,13 +83,14 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         dpo_forward: Optional[bool] = None,
         cache_position=None,
+        use_vision_zip: bool = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None and attention_mask is not None:
             # donate multi-dialogue 
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels, conversation_ids) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, is_llada=True, use_vision_zip=use_vision_zip)
         elif inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes, use_vision_zip=use_vision_zip)
             conversation_ids = None
         if dpo_forward:
             outputs = self.model(
@@ -130,6 +131,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         modalities: Optional[List[str]] = ["image"],
+        use_vision_zip: bool = False,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         modalities = kwargs.pop("modalities", None) if "modalities" in kwargs and modalities is None else modalities
@@ -139,7 +141,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes, use_vision_zip=use_vision_zip)
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 

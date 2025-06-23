@@ -195,6 +195,55 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
+    def select_pixel(self, image_features, attn_logits, attn_key, st_idx):
+        dominant_num = int(0.65 * attn_logits.size(0))
+        contextual_num = max(int(0.05 * attn_logits.size(0)),1)
+        topk_values, topk_indices = torch.topk(attn_logits, dominant_num)
+
+        mask = torch.zeros_like(attn_logits, dtype=torch.bool)
+        mask[topk_indices] = True  
+        contextual_mask = ~mask
+        metric_filtered = attn_key[:,contextual_mask]
+        metric_normalized = metric_filtered / metric_filtered.norm(dim=-1, keepdim=True) 
+        del attn_key, metric_filtered
+
+        ## Contextual Visual Tokens
+        step = max(1, metric_normalized.shape[1] // contextual_num)
+        target_indices = torch.arange(0, metric_normalized.shape[1], step, device=metric_normalized.device)[:contextual_num]
+        target_tokens = metric_normalized[:, target_indices, :]
+
+        tokens_to_merge = metric_normalized[:, ~torch.isin(torch.arange(metric_normalized.shape[1], device=metric_normalized.device), target_indices), :]
+        similarity = torch.bmm(tokens_to_merge, target_tokens.transpose(1, 2))
+        assign_one_hot = torch.zeros(tokens_to_merge.shape[0], tokens_to_merge.shape[1], contextual_num, dtype=attn_logits.dtype, device=metric_normalized.device)
+        assign_one_hot.scatter_(2, similarity.argmax(dim=2).unsqueeze(-1), 1)
+        counts = assign_one_hot.sum(dim=1).clamp(min=1).unsqueeze(-1)
+
+        select_mask = torch.zeros_like(attn_logits, dtype=torch.bool)
+        select_mask[topk_indices] = True
+
+        false_pos = (~select_mask).nonzero(as_tuple=True)[0]   
+
+        select_mask[false_pos[target_indices]] = True
+
+
+        img_mask = torch.ones(image_features.shape[0], dtype=torch.bool)
+        # st_idx = torch.nonzero(img_mask, as_tuple=True)[0]         
+        
+        # if st_idx.numel() > 0:
+            # first, last = st_idx[0].item(), st_idx[-1].item()     
+        img_mask[0:image_features.shape[0]] = ~select_mask
+        img_mask = ~img_mask
+        contexual_input_idx = false_pos[target_indices]
+
+        hidden_states_filtered = image_features[contextual_mask]
+        hidden_to_merge = hidden_states_filtered[~torch.isin(torch.arange(hidden_states_filtered.shape[0], device=hidden_states_filtered.device), target_indices), :]
+        aggregated_hidden = torch.bmm(assign_one_hot.transpose(1, 2), hidden_to_merge.unsqueeze(0)) / counts
+        target_hidden = hidden_states_filtered[target_indices, :]  
+        
+        contextual_tokens = target_hidden.unsqueeze(0) + aggregated_hidden
+
+        return contextual_tokens, contexual_input_idx, img_mask
+
     def encode_multimodals(self, videos_or_images, video_idx_in_batch, split_sizes=None):
         videos_or_images_features = self.get_model().get_vision_tower()(videos_or_images)
         per_videos_or_images_features = torch.split(videos_or_images_features, split_sizes, dim=0)  # tuple, (dim_1, 576, 4096)
@@ -347,39 +396,33 @@ class LlavaMetaForCausalLM(ABC):
         
         return conversation_ids
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, is_llada=False):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, is_llada=False, use_vision_zip=False):
         vision_tower = self.get_vision_tower()
-        # rank_print(modalities)
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels
+        if vision_tower is None or images is None or len(images) == 0:
+            if past_key_values is not None and vision_tower is not None and hasattr(self.get_model(), "config") and getattr(self.get_model().config, "mm_use_im_start_end", False) and input_ids.shape[1] == 1:
+                # in case in generation, where we only pass in the <bos> token
+                return input_ids, position_ids, attention_mask, past_key_values, None, labels, conversation_ids if is_llada else None
+            else:
+                return input_ids, position_ids, attention_mask, past_key_values, None, labels, conversation_ids if is_llada else None
 
         if isinstance(modalities, str):
             modalities = [modalities]
 
-        # import pdb; pdb.set_trace()
-        if type(images) is list or images.ndim == 5:
-            if type(images) is list:
-                images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+        if type(images) is list or (images.ndim == 5 and all(modality == "video" for modality in modalities)):
+            # video processing, TODO: Check for batched video
+            # currently, we only support batch size 1 for video, and only one video per sample
+            if use_vision_zip:
+                raise ValueError("Vision Zip is not supported for video yet")
+            
+            video_idx_in_batch = [i for i, modality in enumerate(modalities) if modality == "video"]
+            image_idx_in_batch = [i for i, modality in enumerate(modalities) if modality == "image"]
 
-            video_idx_in_batch = []
-            for _ in range(len(modalities)):
-                if modalities[_] == "video":
-                    video_idx_in_batch.append(_)
+            images = [images[idx] for idx in image_idx_in_batch] + [v for v in self.flatten(images) if isinstance(v, torch.Tensor)]
 
-            images_list = []
-            for image in images:
-                if image.ndim == 4:
-                    images_list.append(image)
-                else:
-                    images_list.append(image.unsqueeze(0))
-
-            concat_images = torch.cat([image for image in images_list], dim=0)
-            split_sizes = [image.shape[0] for image in images_list]
+            concat_images = torch.cat([image for image in images], dim=0)
+            split_sizes = [image.shape[0] for image in images]
             encoded_image_features = self.encode_images(concat_images)
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
-            # This is a list, each element is [num_images, patch * patch, dim]
-            # rank_print(f"Concat images : {concat_images.shape}")
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
@@ -387,9 +430,7 @@ class LlavaMetaForCausalLM(ABC):
                     image_features.append(self.get_2dPool(image_feat))
                 else:
                     image_features.append(image_feat)
-            # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
-            # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
-            # image_features = torch.split(image_features, split_sizes, dim=0)
+
             mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
             image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
             mm_newline_position = getattr(self.config, "mm_newline_position", "one_token")
@@ -513,7 +554,24 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
+            # This is the part for a batch of single images, which was broken.
             image_features = self.encode_images(images)
+            if use_vision_zip:
+                # Placeholder for getting real attention scores
+                # You will need to replace this with your actual implementation
+                attn_logits = torch.randn(image_features.shape[1], 1, device=image_features.device)
+                attn_key = torch.randn(1, image_features.shape[1], image_features.shape[2], device=image_features.device)
+                
+                # Assuming batch size is 1 for simplicity in this initial implementation
+                # The select_pixel function expects a single image's features
+                if image_features.shape[0] == 1:
+                    compressed_features, _, _ = self.select_pixel(image_features[0], attn_logits, attn_key, 0)
+                    image_features = [compressed_features] # put it back into a list
+                else:
+                    # If batch size > 1, we just use the original features for now.
+                    # You would need to loop or batch-process select_pixel here.
+                    image_features = torch.split(image_features, 1, dim=0)
+                    image_features = [x[0] for x in image_features]
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
