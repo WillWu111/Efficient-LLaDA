@@ -190,10 +190,10 @@ class LlavaMetaForCausalLM(ABC):
         return image_feature
 
     def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+        image_features, attn_logits, attn_key = self.get_model().get_vision_tower()(images, output_attentions=True)
         # image_features = self.get_model().vision_resampler(image_features, images=images)
         image_features = self.get_model().mm_projector(image_features)
-        return image_features
+        return image_features, attn_logits, attn_key
     
     def select_pixel(self, image_features, attn_logits, attn_key, st_idx):
         dominant_num = int(0.65 * attn_logits.size(0))
@@ -421,7 +421,7 @@ class LlavaMetaForCausalLM(ABC):
 
             concat_images = torch.cat([image for image in images], dim=0)
             split_sizes = [image.shape[0] for image in images]
-            encoded_image_features = self.encode_images(concat_images)
+            encoded_image_features, attn_logits, attn_key = self.encode_images(concat_images)
 
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
             image_features = []
@@ -554,24 +554,29 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            # This is the part for a batch of single images, which was broken.
-            image_features = self.encode_images(images)
+            # This is the part for a batch of single images.
+            image_features, attn_logits, attn_key = self.encode_images(images)
             if use_vision_zip:
-                # Placeholder for getting real attention scores
-                # You will need to replace this with your actual implementation
-                attn_logits = torch.randn(image_features.shape[1], 1, device=image_features.device)
-                attn_key = torch.randn(1, image_features.shape[1], image_features.shape[2], device=image_features.device)
-                
                 # Assuming batch size is 1 for simplicity in this initial implementation
-                # The select_pixel function expects a single image's features
                 if image_features.shape[0] == 1:
-                    compressed_features, _, _ = self.select_pixel(image_features[0], attn_logits, attn_key, 0)
+                    # The attn_logits and attn_key are now real values from the vision tower
+                    # We might need to process them to match the expected format, e.g., taking the mean over heads
+                    # For now, let's assume they are in the correct format as a placeholder for the logic.
+                    # Example processing (you may need to adjust this):
+                    processed_attn_logits = attn_logits.mean(dim=(0, 1)) # from (bs, h, s, s) to (s,)
+                    processed_attn_key = attn_key.mean(dim=(0, 1)) # from (bs, h, s, d) to (s, d)
+                    
+                    compressed_features, _, _ = self.select_pixel(image_features[0], processed_attn_logits, processed_attn_key.unsqueeze(0), 0)
                     image_features = [compressed_features] # put it back into a list
                 else:
                     # If batch size > 1, we just use the original features for now.
                     # You would need to loop or batch-process select_pixel here.
                     image_features = torch.split(image_features, 1, dim=0)
                     image_features = [x[0] for x in image_features]
+            else:
+                 # convert to list
+                image_features = torch.split(image_features, 1, dim=0)
+                image_features = [x[0] for x in image_features]
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, "tune_mm_mlp_adapter", False) and getattr(self.config, "mm_use_im_start_end", False):
